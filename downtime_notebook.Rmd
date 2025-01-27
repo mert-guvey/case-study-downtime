@@ -1,0 +1,1456 @@
+---
+title: "Case Study: A Look Into Causes of Machine Breakdown"
+output: html_notebook
+---
+
+## Introduction
+
+In this notebook I share the results of some exploratory data analysis work for a project I intended to submit to a [contest](https://app.datacamp.com/learn/competitions/industrial-machine-level-3). Unfortunately I somewhat hit a wall in the modelling process, and by the time I decided to make the switch to the [visualization section](https://app.datacamp.com/learn/competitions/industrial-machine-level-2), it was a little too late for me to create a workable report. The learning experience was however still valuable, and I have decided to go ahead and finish up on the findings.
+
+The data consists of 2500 readings from three industrial machines, over the course of a eight-month period. These readings relate to a total of 12 different parameters, such as hydraulic pressure, cutting, torque etc. Each reading is associated with machine downtime or the lack thereof. The motivating questions are as follows:
+
+-   What is the nature of the correlation between operational data?
+-   Are there any temporal patterns to machine downtime?
+-   Which factors are relevant to machine downtime?
+
+There are some flaws in the data with regard to these questions. First, it is stated that a reading with machine failure is indicative of downtime on a given day, whereas in the opposite case there is none. This is in contradiction to the fact that there are often multiple readings on the same day for a given machine with some indicating failure and others not. Second, there is no consistency in the number of daily readings, although strictly speaking the numbers show an increasing trend until peaking in the middle of the period, and then decline back to initial values. Moreover, there are quite a few gaps in the recording outside the middle four-month period. Altogether, these factors make it challenging to establish a notion of temporal dependency. I have nevertheless examined two possible cases where the changes in downtime readings over time may be meaningful.
+
+I interpret the data mostly through visualization. Many of these are based on standardized values to put emphasis on underlying patterns, and lack any numeric guides as such. Based on the emerging patterns, I have decided to explore the correlations using correspondence analysis, first with a general and then a more detailed approach.
+
+### Chapters
+
+0.  Executive Summary
+
+1.  Investigating Time Dependency
+
+    1a. Operational Status over Time
+
+    1b. Failure Proportion over Time
+
+2.  Overview of Operational Parameters
+
+    2a. Distributions of Operational Parameters
+
+    2b. Densities Conditional on Failure
+
+    2c. Safety and Failure Ranges on Operational Parameters
+
+3.  Factor Analysis of Operational Parameters
+
+    3a. Correspondence Analysis
+
+    3b. Multiple Correspondence Analysis
+
+4.  Conclusion
+
+## 0. Executive Summary
+
+In the present analysis, we have studied 2500 readings taken over seven months by way of visualization. Due to how the data has been collected, understanding the effect of time has been challenging. In the first case, we assumed the proportion of non-failure readings on a given day reflected the machine's operational status on that day. In the second case, we assumed that only the number of failures were indicative for a given day. Comparing these to daily means of operational parameters, we have in neither case found a meaningful relation. Looking at the readings as independent cases however, we were able to find that six parameters are decisive, those being cutting force, spindle speed, coolant temperature, coolant pressure, hydraulic pressure and torque. Our findings suggest that certain values of these parameters are associated with certainty of failure or safety, and in turn, almost all cases of failure or safety will have at least one of the parameters at a value that is associated with its status (only 39 readings are exceptions). Although we found no significant correlation between parameters, it is possible that certain combinations of parameters are more likely to be "active" in case of safety or failure.
+
+*Preparation*
+
+```{r package load,message=FALSE,warning=FALSE}
+library(tidyverse)
+library(FactoMineR)
+library(factoextra)
+library(colorspace)
+library(magrittr)
+library(visdat)
+library(ggrepel)
+```
+
+```{r data load,message=FALSE,warning=FALSE}
+dataset <- 
+  read_delim(file = "downtime.csv", delim = ",")
+
+head(dataset)
+#' There is very little missing data, although it is notable that absence 
+#' of coolant temperature is linked with absence of coolant pressure. I have
+#' proceeded with the assumption of MCAR at this stage, leaving the door open 
+#' for a future revisit.
+vis_miss(dataset)
+```
+
+*Since I am keeping most of the code I have written in this final version of the notebook, I will be commentating throughout the report to share my thought process. I suppose you could skip those parts, but as the data is inconsequential and it is rather unlikely you would be reading this unless you were interested in seeing what I have done, I am guessing you will not. Thank you and I hope you find this an enjoyable read.*
+
+*If available, feel free to hide all code at first by going to the drop-down menu at the top right. This will make it easier to navigate the report and the collapsed chunks can be viewed by clicking their "show" button.*
+
+```{r initial prep,message=FALSE,warning=FALSE}
+original_names <- 
+  # Grammatical treatment of column names, will come in handy for labeling in plots
+  colnames(dataset)[-c(2,3)] %>%
+  str_replace_all("_", " ") %>%
+  str_replace_all("[(]", " (")
+
+new_names <- 
+  # Variable names that are more comfortable to work with
+  c(
+    "date",
+    "h_pres",
+    "c_pres",
+    "a_pres",
+    "c_temp",
+    "h_temp",
+    "s_temp",
+    "s_vibration",
+    "t_vibration",
+    "speed",
+    "voltage",
+    "torque",
+    "cutting"
+    )
+
+label_vector <-
+  # See original_names
+  original_names |> setNames(new_names)
+
+naming_vector <-
+  # See new_names
+  colnames(dataset)[-c(2, 3, 16)] |> setNames(new_names)
+
+dataset <-
+  dataset %>%
+    mutate(
+      across(
+       .cols = c(`Spindle_Speed(RPM)`, `Voltage(volts)`),
+       .fns = as.integer
+        ),
+      across(
+        #' There is one negative value for hydraulic pressure and
+        #' spindle vibration each. To avoid stepping on tripwires,
+        #' I set everything non-negative, but the value for hydraulic
+        #' pressure remains unusually low.
+        .cols = where(is.numeric),
+        .fns = abs
+        ),
+      Date = dmy(Date)
+    ) %>%
+    mutate(
+      # There are only three machines therefore the ID and line number 
+      # carry little relevant information
+      year = str_sub(Machine_ID, -4L),
+      line = str_sub(Assembly_Line_No, -2L),
+      status = 
+        case_when(
+          Downtime == "Machine_Failure" ~ 0L,
+          Downtime == "No_Machine_Failure" ~ 1L
+      ),
+      .keep = "unused"
+    ) %>%
+    rename(naming_vector) %>%
+    arrange(date) %>%
+    mutate(
+      # Unique identifiers just in case
+      obs_id = 
+        as.character(1:nrow(dataset)) %>%
+        str_pad(width = 4, side = "left", pad = "0"),
+      .before = everything()
+    )
+
+outliers <-
+  # Pulled outliers as well, but didn't end up putting it into any use -
+  # most of the work was done with transformed data which are robust to outliers
+  dataset %>%
+  select(
+    where(is.numeric) & !status
+    ) %>%
+  names() %>%
+  map(
+    .f = 
+      ~ dataset[which(dataset[[.x]] %in% boxplot.stats(dataset[[.x]])[["out"]]),]
+    ) %>%
+  list_rbind()
+
+dataset_standardised <-
+  # Standardised values for time series and distribution comparison
+  dataset %>%
+  mutate(
+    across(
+      .cols = 3:14,
+      .fns = \(col) scale(col, center = FALSE)[, 1]
+    )
+  )
+
+dataset_percentiles <-
+  # Percentile transformation for future tasks
+  dataset %>%
+  modify_at(
+    .at = 
+      3:14,
+    .f =
+      function (col) {
+        q <- quantile(col, probs = seq(.01, 1, .01), na.rm = TRUE, names = FALSE)
+        qq <- 
+          distinct(tibble(start = lag(q, default = 0), end = q)) %>% 
+          cbind(pct = 1:nrow(.))
+        
+        left_join(
+          x = tibble(c = col),
+          y = qq,
+          by = join_by(between(c, start, end, bounds = "[)"))
+          ) %>%
+        mutate(
+          pct = ifelse(!is.na(c) & is.na(pct), 100, pct)
+          ) %>%
+        pull(pct)
+      }
+    )
+
+line_vector <- c("L1", "L2", "L3")
+```
+
+*The percentile transformation is something that has occurred to me later in the analysis, but I am putting it up there to keep things nice and tidy. Otherwise it is mostly mundane data cleaning tasks. There are some outliers here and there -six 0 readings for spindle speed for example- but nothing that should jeopardize data exploration.*
+
+```{r initial status/count viz,fig.width=10,message=FALSE,warning=FALSE,echo=FALSE}
+ggplot(data = dataset) +
+  geom_bar(
+    mapping = aes(date, fill = as.factor(status))
+    ) +
+  scale_y_continuous(
+    name = NULL, position = "right"
+    ) +
+  scale_fill_discrete(
+    name = NULL, labels = c("Down", "Up"), 
+    type = diverge_hcl(n = 2, palette = "Blue-Red 2", rev = TRUE)
+    ) +
+  facet_wrap(
+    facets = vars(line), nrow = 3, strip.position = "left"
+    ) +
+  labs(
+    title = "Results over the Monitoring Period",
+    subtitle = "by assembly line, from 2021-11-24 to 2022-07-03"
+    ) +
+  theme(
+    strip.text.y.left = element_text(angle = 0),
+    strip.background = element_rect(fill = "gray95"),
+    axis.title.x = element_blank(),
+    legend.position = "bottom",
+    panel.background = element_blank()
+    )
+```
+
+*I include this graph of readings over time as an initial view of the data. The operational status is evenly split (1265 failures out of 2500 readings) and the reading frequency only really picks up from the end of January to the beginning of May, during which period it remains very erratic. I am concerned with the possibility that reading counts are somehow linked with reported failures on a given day. Failures might trigger readings, or the factory might be more likely to take readings on quiet days. It would also not be very surprising if the data had no failures on most days (quite the opposite in fact - this would be a terrible factory if it were real) in which case we could treat the days having failures as "failure days", as implied by the description of the data. After some digging however, I found that the proportion of failure readings is quite balanced among varying counts, and as the count increases, said proportion tends to 50% with a slight positive deviation for some extreme values.*
+
+```{r aggregation on dates,message=FALSE,warning=FALSE}
+# Get average values and operational status values for a given day
+means_series <-
+  nest(dataset, .by = line) %>%
+    mutate(
+      across(
+        # Getting the number of failures for each line, in its own column
+        .cols = data,
+        .fns = ~ map_int(.x, \(df) nrow(filter(df, status == 0))),
+        .names = "fail_count"
+        )
+      ) %>%
+    unnest(cols = data) %>%
+    summarise(
+      fail_prop =
+        #' Proportion of failures on a given day to the general sum, 
+        #' on a line basis - this is a target variable
+        sum(status == 0) / min(fail_count),
+      across(
+        .cols = where(is.numeric) & !fail_count,
+        # Daily mean values for predictor variables, as well as operational status
+        .fns = \(col) mean(col, na.rm = TRUE)
+        ),
+      obs_count = n(),
+      .by = c(date, line)
+    )
+
+stdmeans_series <-
+  nest(dataset_standardised, .by = line) %>%
+    mutate(
+      across(
+        .cols = data,
+        .fns = ~ map_int(.x, \(df) nrow(filter(df, status == 0))),
+        .names = "fail_count"
+        )
+      ) %>%
+    unnest(cols = data) %>%
+    summarise(
+      fail_prop =
+        sum(status == 0) / min(fail_count),
+      across(
+        .cols = where(is.numeric) & !fail_count,
+        .fns = \(col) mean(col, na.rm = TRUE)
+        ),
+      obs_count = n(),
+      .by = c(date, line)
+      )
+```
+
+```{r time-based masking,message=FALSE,warning=FALSE}
+series_window <-
+  #' This is the longest stretch of time the lines have been continuously recorded,
+  #' except for a couple gaps on L3.
+  seq.Date(as.Date("2022-01-23"), as.Date("2022-05-07"), by = 1L)
+
+means_series_main <-
+  # Extract readings that fall within the given window above
+  means_series %>%
+  filter(date %in% series_window) %>%
+  group_by(line)
+
+stdmeans_series_main <-
+  stdmeans_series %>%
+  filter(date %in% series_window) %>%
+  group_by(line)
+```
+
+```{r difference transformations,message=FALSE,warning=FALSE}
+#' Also taking first differences in case some variables are non-stationary
+diffs_series <-
+  means_series_main %>%
+  mutate(
+    cur_status = status,
+    cur_obs_count = obs_count,
+    across(
+      .cols = 
+        where(is.numeric) & !starts_with(c("cur", "fail")),
+      .fns = 
+        \(x) x - lag(x)
+    )
+  )
+
+stddiffs_series <-
+  stdmeans_series_main %>%
+  mutate(
+    cur_status = status,
+    cur_obs_count = obs_count,
+    across(
+      .cols = 
+        where(is.numeric) & !starts_with(c("cur", "fail")),
+      .fns = 
+        \(x) x - lag(x)
+    )
+  )
+```
+
+```{r plot_corr}
+ #' cor() wrapper for viewing the results in ggplot2
+ #' 
+ #' @param data A dataframe or matrix containing two or more numeric columns.
+ #' @param drop <[`tidy-select`][dplyr::dplyr_tidy_select]> Specify which columns to exclude from the calculation.
+ #' @param lag An integer specifying the time shift for autocorrelation. Default is 0. 
+ #' @param ... <[`dynamic-dots`][rlang::dyn-dots]> Arguments to be passed onto <[`cor`][base::cor]>.
+ #' 
+ #' @return A ggplot2 tile plot representing correlation values
+ 
+ plot_corr <- function (data, drop = !everything(), lag = 0L, ...) {
+   
+   if (lag != as.integer(lag) | lag < 0) stop("lag value must be a non-negative integer")
+   
+   raw <- select(data, !{{ drop }} & where(is.numeric))
+   
+   if (sum(map_lgl(raw, is.numeric)) < 2) stop("data must have two or more numeric columns")
+   
+   if (lag == 0) {
+     s <- raw
+     note <- NULL
+   } else {
+     s <- modify(raw, ~ lag(.x, n = {{ lag }}))
+     note <- paste("Lag:", as.character({{ lag }}))
+   }
+   
+   cor_matrix <- 
+     if ("y" %in% names(list(...))) cor(x = raw, ...) else cor(x = raw, y = s, ...)
+   
+   plot_frame <-
+    as.data.frame(cor_matrix) |>
+    rownames_to_column(var = "x") |>
+    as_tibble() %>%
+    pivot_longer(
+      cols = -x,
+      names_to = "y", values_to = "corr"
+      ) %>%
+    mutate(
+      across(.cols = c(x, y), .fns = factor),
+      corr = round(corr, 2)
+      ) %>%
+    filter(
+      if (lag == 0L) x != y & as.numeric(x) > as.numeric(y) else TRUE
+      )
+    
+    ggplot(data = plot_frame) +
+      geom_tile(
+        mapping = 
+          aes(x = x, y = y, fill = corr - .5)
+        ) +
+      geom_text(
+        mapping = 
+          aes(x = x, y = y, label = corr),
+        color = "white"
+        ) +
+      scale_x_discrete(name = NULL) +
+      scale_y_discrete(name = NULL) +
+      scale_fill_gradient(
+        name = NULL, guide = NULL, low = "maroon3", high = "darkslategray3"
+        ) +
+      coord_fixed() +
+      labs(subtitle = note) +
+      theme(
+        panel.background = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)
+        )
+ }
+```
+
+```{r (auto)correlation maps,fig.dim=c(8,8),message=FALSE,warning=FALSE}
+dataset[, -17] %>%
+  plot_corr(use = "pairwise.complete.obs") +
+  ggtitle("General Correlation Matrix")
+
+lapply(
+  X = 
+    line_vector,
+  FUN = 
+    function (line) {
+      means_series_main %>%
+        filter(line == {{ line }}) %>%
+        ungroup() %>%
+        plot_corr(
+          drop = c(obs_count, status, fail_prop), lag = 1, 
+          use = "pairwise.complete.obs"
+          ) +
+        ggtitle(paste(line, "Autocorrelation Matrix"))
+    }
+)
+```
+
+*Just a few correlation matrices to show that the various parameters don't have a linear relationship, before moving on to the first section. The autocorrelation matrices are based on daily aggregate values for each line with a lag of one, and with the largest values around 0.35, it seems safe to rule out the possibility that daily mean values are dependent on those of the previous day.*
+
+## 1. Investigating Time Dependency
+
+### 1a. Operational Status over Time
+
+As it is not immediately clear how the readings may relate to each other over time, we will depart from two possible notions of failure. First, we will assume that on a given day, the proportion of non-failure readings reflect the uptime for that day, e.g. one failure out of four readings would mean that the machine has experienced 75% uptime on the day in question. Based on this, we define the variable "status" as the proportion of uptime from 0 to 1, and against it we plot the time series of daily means belonging to operational parameters. The analysis will comprise the period of 2022-01-23 to 2022-05-07, as this is the only time window the parameters were continuously observed for a meaningfully long time. We also assume that the readings taken from different machines are independent of each other and consider each machine separately.
+
+We start by noting that the parameters air system pressure, hydraulic oil temperature, spindle bearing temperature and voltage remain fairly constant over the duration of recording. With the other parameters however, we fail to notice an underlying trend or movement in concordance with our status parameter. Although it might seem that spikes in either direction by coolant temperature correspond to some drastic shifts in status, we could not find any particular patterns that stand out from the noise. It does not help that the status variable as we have defined it is very close to 0.5 most of the time, leaving little room for interpretation.
+
+```{r means ot vs daily status,message=FALSE,warning=FALSE}
+lapply( # Means over time against daily operational status
+  X = 
+    line_vector,
+  FUN =
+    function (lineid) {
+      ggplot() +
+        geom_tile(
+          #' Setting up tile background based on status
+          data =
+            stdmeans_series_main %>%
+              select(date, line, status) %>%
+              ungroup() %>%
+              filter(line == lineid),
+          mapping =
+            aes(x = date, y = .5, height = Inf, fill = status - .5),
+          alpha = .8
+          ) +
+        geom_line(
+          #' The pre-processing here enables the viewing 
+          #' of each parameter in parallel,
+          #' in strict terms as "small multiples"
+          data =
+            stdmeans_series_main %>%
+              pivot_longer(
+                cols = where(is.numeric) & !contains("obs_count"),
+                names_to = "measure", values_to = "mean"
+              ) %>%
+              ungroup() %>%
+              filter(
+                !(measure %in% c("status", "fail_prop")),
+                line == lineid
+              ),
+          mapping = 
+            aes(date, mean),
+          linewidth = .7
+          ) +
+        scale_y_continuous(
+          name = NULL, guide = NULL
+          ) +
+        scale_fill_continuous_diverging(
+          #' This one is imported from the package colorspace, which has saved me
+          #' quite a bit of headache setting colors and such
+          name = NULL, guide = NULL, palette = "Blue-Red 2", rev = TRUE
+          ) +
+        facet_wrap(
+          facets = vars(measure), nrow = 12, strip.position = "top", 
+          labeller = as_labeller(label_vector)
+          ) +
+        labs(
+          title = paste(lineid, "Standardized daily means over time"),
+          subtitle = 
+            "against daily operational status, from 2022-01-23 to 2022-05-07",
+          x = NULL
+          ) +
+        theme(
+          legend.title = element_text(vjust = .8),
+          strip.text = element_text(hjust = 0),
+          strip.background = element_blank(),
+          panel.background = element_blank()
+          )
+    }
+)
+```
+
+### 1b. Failure Proportion over Time
+
+Our second approach will be to consider the number of failures as the measure of severity on a given day. In this case, each failure reading will be considered an individual instance of downtime, and the more failures in a day, the more severe it will be qualified regardless of the number of readings on said day. Readings without failures will be separately considered to help understand safe operating conditions. When plotting, we take the extra step of proportioning the failure count to total failures for that line as a way of standardizing across lines.
+
+Again the results are not very encouraging. In particular, it is telling in L2's case, how most lines simply dash through the failure spike in the middle. Since we have again failed to find hints of time dependency, we will put the issue to rest at this stage and focus on readings as independent observations.
+
+```{r means ot vs fail prop,echo=FALSE,message=FALSE,warning=FALSE}
+lapply( # Means over time against failure proportion on a given day
+  X = line_vector,
+  FUN =
+    function (lineid) {
+      ggplot() +
+        geom_tile(
+          data =
+            stdmeans_series_main %>%
+              select(date, line, fail_prop) %>%
+              ungroup() %>%
+              filter(line == lineid),
+          mapping =
+            aes(x = date, y = .5, height = Inf, alpha = fail_prop),
+          fill = "indianred"
+          ) +
+        geom_line(
+          data = 
+            stdmeans_series_main %>%
+              pivot_longer(
+                cols = where(is.numeric) & !contains("obs_count"),
+                names_to = "measure", values_to = "mean"
+              ) %>%
+              ungroup() %>%
+              filter(
+                !(measure %in% c("cur_status", "status", "fail_prop")),
+                line == lineid
+              ),
+          mapping = 
+            aes(date, mean)
+          ) +
+        scale_y_continuous(
+          name = NULL, guide = NULL
+          ) +
+        scale_alpha_continuous(
+          name = NULL, guide = NULL
+          ) +
+        facet_wrap(
+          facets = vars(measure), nrow = 12, strip.position = "top", 
+          labeller = as_labeller(label_vector)
+          ) +
+        labs(
+          title = paste(lineid, "Standardised daily means over time"),
+          subtitle = 
+            "against proportion of daily failures to final total, from 2022-01-23 to 2022-05-27",
+          x = NULL
+          ) +
+        theme(
+          strip.text = element_text(hjust = 0),
+          strip.background = element_blank(),
+          panel.background = element_blank()
+          )
+    }
+)
+```
+
+## 2. Overview of Operational Parameters
+
+### 2a. Distributions of Operational Parameters
+
+We can now start by taking a look at variable distributions. The overly stacked appearance of air system pressure, voltage etc. is mostly an artifact of plot layout and parameters, but also supported by the static trend that we have seen in the time series above. Spindle vibration and tool vibration similarly exhibit a well-behaved distribution. However, the remaining variables show peculiarities, with multiple peaks and abrupt gaps between values. As for the machines, there is remarkably little difference between their respective distributions.
+
+```{r histograms production, fig.width=20, message=FALSE, warning=FALSE}
+dataset_standardised %>%
+  pivot_longer(
+    cols = 3:14,
+    names_to = "measure"
+  ) %>%
+  ggplot() +
+    geom_histogram(
+      mapping = 
+        aes(value, fill = line),
+      position = "dodge"
+    ) +
+    scale_x_continuous(
+      name = NULL, guide = NULL, limits = c(0, 2) 
+    ) +
+    scale_y_continuous(
+      name = NULL, guide = NULL
+    ) +
+    scale_fill_discrete(
+      name = "Line", type = sequential_hcl(n = 3, palette = "SunsetDark")
+    ) +
+    facet_wrap(
+      facets = vars(line, measure), nrow = 3, 
+      labeller = as_labeller(append(label_vector, c(L1 = "", L2 = "", L3 = "")))
+    ) +
+    labs(
+      title = "Distributions of Operational Parameters",
+      subtitle = "by assembly line"
+    ) +
+    theme(
+      panel.background = element_rect(fill = "gray95"),
+      plot.background = element_rect(fill = "gray95"),
+      panel.grid = element_blank(),
+      legend.background = element_rect(fill = "gray95"),
+      strip.text = element_text(hjust = 0),
+      strip.background = element_blank()
+    )
+```
+
+### 2b. Densities Conditional on Failure
+
+We delve a step deeper by making a distinction on the basis of failure. In this case we avoid faceting by machine, given that they have very similar distributions. Looking at the resulting charts, there is now a very clear explanation for the behavior of the six variables we have noticed in histograms- they have different characteristics in cases of failure and non-failure. In contrast, for the remaining variables, there is a complete overlap regarding their behavior in either case, suggesting that their values are inconsequential to the status of a given reading.
+
+```{r density graphs raw,fig.height=10,echo=FALSE,message=FALSE,warning=FALSE}
+dataset_standardised %>%
+  pivot_longer(
+    cols = where(is.numeric) & !status,
+    names_to = "measure"
+  ) %>%
+    ggplot() +
+      geom_density(
+        mapping = 
+          aes(value, fill = as.factor(status)), 
+          alpha = .5
+        ) +
+      scale_x_continuous(
+        name = NULL, guide = NULL, limits = c(0, 2)
+        ) +
+      scale_y_continuous(
+        name = NULL, guide = NULL
+        ) +
+      scale_fill_discrete(
+        name = NULL, labels = c("Down", "Up"), 
+        type = diverge_hcl(n = 2, palette = "Blue-Red 2", rev = TRUE)
+        ) +
+      facet_wrap(
+        facets = vars(measure), nrow = 6, labeller = as_labeller(label_vector)
+        ) +
+      labs(
+        title = "Density Graphs for Operational Parameters",
+        subtitle = "conditional on machine failure, for all lines"
+        ) +
+      theme(
+        strip.text.x = element_text(hjust = 0),
+        strip.background = element_blank(),
+        legend.position = "bottom",
+        panel.background = element_blank()
+        )
+```
+
+*The reason I made the switch to density graphs from histograms is that I feel it conveys the idea of conditional distribution better, in contrast to the sharp blocky view that would result from plotting a histogram.*
+
+*This is where the percentile data comes in. I want to split the parameter ranges into zones of high or low failure probability. Percentiles are suitable for aggregation and are separated by a fixed distance, which renders this task a lot easier.*
+
+*The below code is a mess and I have done my best to explain it. I wouldn't be surprised at all if there is a much less complicated way to do the same thing, but I am a little wary of tinkering at this point.*
+
+```{r sf_table,message=FALSE,warning=FALSE}
+#' Since there seems to be heavy discrepancy between the values for some variables
+#' depending on failure status, I am interested in finding out which values and
+#' ranges are associated with a high probability of safety or failure. 
+
+sf_table <-
+  dataset_percentiles %>%
+    # Pre-processing for map calls
+    select(c(3:14, 17)) %>%
+    pivot_longer(
+      cols = !status,
+      names_to = "measure", values_to = "percentile"
+      ) %>%
+    summarise(
+      #' Proportion of readings that are not failures
+      #' for the given percentile
+      status = mean(status),
+      .by = c(measure, percentile)
+      ) %>%
+    union(
+      # Include missing instances, for continuity
+      y =
+        anti_join(
+          x = 
+            expand_grid(
+              measure = unique(.[["measure"]]),
+              percentile = 0:99
+            ),
+          y = .,
+          by = c("measure", "percentile")
+        ) %>%
+        cbind(status = NA)
+      ) %>%
+    group_by(measure) %>%
+    arrange(percentile) %>%
+    fill(
+      status, .direction = "down"
+      ) %>%
+    filter(!is.na(percentile)) %>%
+    mutate(
+      # Change in status
+      diff = status - lag(status, default = 0L)
+      ) %>%
+    arrange(measure, percentile) %>%
+    nest() %>%
+    # End pre-processing
+    pmap(
+      #' Get percentile ranges with failure rate of one or zero, 
+      #' as well as those having constant failure rate
+      #' The mapper will loop over measures
+      .f =
+        function (measure, data) {
+          init_sp <-
+            data |>
+              split(
+                # Start by separating individual percentiles from intervals
+                ~ diff == 0 | !(lead(diff) != 0 | percentile == 99)
+                ) |>
+              setNames(
+                c("singles", "intervals")
+                )
+        
+          intervals_frame <-
+          #' The idea is to split the initial dataframe into sub-dataframes, 
+          #' each corresponding to a given range of consecutive values having the
+          #' same status value.
+          #' We then collect all relevant information for each interval 
+          #' (dataframe) in a single row, to collect them again in a new table.
+          
+            init_sp[["intervals"]] |>
+              split(
+                #' Making sure different types of intervals are treated separately,
+                #' mostly to help with indexing, also conveniently giving a list
+                #' structure.
+                ~ ifelse(
+                    status == 0, 
+                    "failure", 
+                    ifelse(status < 1, "static", "success")
+                    )
+                ) %>%
+               map(
+                 .f =
+                   function (data) {
+                       data |>
+                       split(
+                        #' Identify breaks, take running sum, index the resulting
+                        #' intervals by the running sum 
+                        ~ (cumsum(seq_along(percentile) %in% 
+                           which(c(1, diff(percentile)) != 1)) + 1) |> 
+                           as.character()
+                         ) %>%
+                       imap(
+                        # Loop over intervals
+                        .f =
+                          function (interval, i) {
+                            tibble(
+                              ind = i,
+                              interval_start = min(interval[["percentile"]]),
+                              interval_end = max(interval[["percentile"]]),
+                              vector_form = list(interval[["percentile"]]),
+                              size = nrow(interval),
+                              status = min(interval[["status"]])
+                              )
+                            }
+                        # End interval loop
+                         ) %>%
+                        list_rbind()
+                      }
+                  # End status loop
+                  ) %>%
+                list_rbind() %>%
+                as_tibble()
+        
+          singles_frame <-
+            # Also include standalone percentiles with failure rate of one or zero
+            init_sp[["singles"]] %>%
+            filter(
+              status %in% c(0, 1)
+              ) %$%
+            tibble(
+              ind = NA, # Opting to index intervals only
+              interval_start = percentile,
+              interval_end = percentile,
+              vector_form = percentile,
+              size = 1,
+              status = status
+              )
+        
+          rbind(
+            # Final dataframe for the given measure
+            intervals_frame,
+            singles_frame
+            ) %>%
+          mutate(
+            measure = {{ measure }},
+            .before = everything()
+            )
+        }
+  ) %>%
+  list_rbind()
+```
+
+*The resulting table has 128 entries, 106 of which belong to our six variables in question. For the most part they have a failure rate of 0 or 1 (or close). Altogether, they cover a significant part of the possible range of values for their respective variables.*
+
+*Let's take a quick look at how much ground is covered. The results are much better than I expected: 1206 non-failures and 1255 failures have at least one value designated as safe or faulty, depending on their status. Since these predictors are each associated with a 100% rate of failure or safety, we don't have to worry about any overlaps. I also repeat the same counts by excluding length one intervals and find that only 13 cases of safety and one case of failure are solely explained by these. This is good to know in case we need to focus on larger intervals.*
+
+```{r mapping to intervals,message=FALSE,warning=FALSE}
+dataset_threshold <-
+  #' Here I convert the parameter values into whether they indicate 
+  #' safety or failure.
+  #' Based on 0% or 100% failure rate percentiles only.
+  dataset_percentiles %>%
+  select(
+    date, line, where(is.numeric)
+    ) %>%
+  imodify(
+    .f =
+      function (col, idcol) {
+        if (idcol %in% c("date", "status", "line")) return(col)
+        case_when(
+          col %in% 
+          (filter(sf_table, measure == idcol, status == 1) %>% 
+          pull(vector_form) %>%
+          unlist()) ~ "safe",
+          col %in% 
+          (filter(sf_table, measure == idcol, status == 0) %>% 
+          pull(vector_form) %>%
+          unlist()) ~ "failure",
+          .default = "inconclusive"
+        )
+      }
+    )
+
+dataset_threshold %>%
+  # Non-failures explained by safety intervals
+  filter(
+    if_any(-c(date, status, line), ~ .x == "safe")
+    ) %>%
+  nrow()
+
+dataset_threshold %>%
+  # Failures explained by failure intervals
+  filter(
+    if_any(-c(date, status, line), ~ .x == "failure")
+    ) %>%
+  nrow()
+
+dataset_threshold_restricted <-
+  dataset_percentiles %>%
+  select(
+    date, line, where(is.numeric)
+    ) %>%
+  imodify(
+    .f =
+      function (col, idcol) {
+        if (idcol %in% c("date", "status", "line")) return(col)
+        case_when(
+          #' The difference here is that I am excluding intervals of length one, 
+          #' to see their impact
+          col %in% 
+          (filter(sf_table, measure == idcol, status == 1, !is.na(ind)) %>%
+          pull(vector_form) %>%
+          unlist()) ~ "safe",
+          col %in% 
+          (filter(sf_table, measure == idcol, status == 0, !is.na(ind)) %>%
+          pull(vector_form) %>%
+          unlist()) ~ "failure",
+          .default = "inconclusive"
+          )
+        }
+    )
+
+dataset_threshold_restricted %>%
+  # Non-failures explained by safety intervals larger than 1
+  filter(
+    if_any(-c(date, status, line), ~ .x == "safe")
+    ) %>%
+  nrow()
+
+dataset_threshold_restricted %>%
+  # Failures explained by failure intervals larger than 1
+  filter(
+    if_any(-c(date, status, line), ~ .x == "failure")
+    ) %>%
+  nrow()
+
+crit_vector <- c("c_pres", "c_temp", "h_pres", "cutting", "speed", "torque")
+```
+
+### 2c. Safety and Failure Ranges on Operational Parameters
+
+Further analysis has revealed the exact ranges on the parameters that are associated with certainty of failure or safety. We have been able to verify that in the vast majority of cases, the reading will have at least one value qualifying as faulty or safe. In particular, 1255 out of the 1265 failures on record are explained by such.
+
+The parameter coolant pressure is the one covered to the highest extent, and more or less evenly at that. Other parameters are slightly more biased towards failure, and coolant temperature seems to be least indicative at first glance.
+
+```{r s/f ranges viz,echo=FALSE,message=FALSE,warning=FALSE}
+# Graph the safety and failure ranges on each parameter
+expand_grid(
+  measure = crit_vector,
+  percentile = 0:99
+) %>%
+left_join(
+  y = unnest(sf_table, cols = c(vector_form)),
+  by = join_by(measure, percentile == vector_form)
+) %>%
+mutate(
+  complete =
+    status %in% c(0, 1)
+) %>%
+  ggplot() +
+    geom_tile(
+      mapping = 
+        aes(
+          x = percentile, y = 0, height = Inf, 
+          fill = as.factor(round(status)), alpha = complete
+          )
+      ) +
+    scale_x_continuous(
+      name = NULL, guide = NULL
+      ) +
+    scale_y_continuous(
+      name = NULL, guide = NULL
+      ) +
+    scale_fill_discrete(
+      name = NULL, guide = NULL, 
+      type = diverging_hcl(n = 2, palette = "Blue-Red", rev = TRUE), 
+      na.value = "gray90"
+      ) +
+    scale_alpha_discrete(
+      name = NULL, guide = NULL, range = c(.6, 1)
+      ) +
+    facet_wrap(
+      facets = vars(measure), nrow = 6, 
+      labeller = as_labeller(label_vector), scales = "free_x", axes = "all_x"
+      ) +
+    labs(
+      title = "Safety and Failure Ranges on Critical Parameters",
+      caption = 
+        "Blue indicates safety whereas maroon indicates failure, lighter shaded areas have up to 5% margin for error"
+      ) +
+    theme(
+      panel.background = element_blank(),
+      strip.background = element_blank(),
+      strip.text = element_text(hjust = 0)
+      )
+```
+
+Looking at activation counts for the various parameters, we can say that in case of failure, there are often more than three or four factors in play. Safety is indicated by fewer parameters in general, usually two or three. As expected, coolant pressure is highly active in both failure or safety, and it is the strongest predictor for safety by far. In contrast, faulty readings of torque are most often encountered. Coolant temperature factors remarkably little for safety. It is rather unlikely for a failure or safety reading to have all relevant parameters active, as it is to be indicated by only one parameter.
+
+```{r activation bar plot,echo=FALSE,message=FALSE,warning=FALSE}
+dataset_threshold %>%
+  mutate(
+    indicator_count =
+      pmap_int(
+        .l =
+          pick(c_pres, c_temp, cutting, h_pres, speed, torque),
+        .f =
+          \(...) sum(c(...) != "inconclusive")
+      )
+    ) %>%
+  summarise(
+    across(
+      .cols = c(c_pres, c_temp, cutting, h_pres, speed, torque),
+      .fns = \(col) sum(col != "inconclusive"),
+      .names = "{col}_active"
+      ),
+    .by = c(status, indicator_count)
+    ) %>%
+  pivot_longer(
+    cols = -c(status, indicator_count)
+    ) %>%
+  mutate(
+    name = str_remove(name, "_active")
+    ) %>%
+  filter(indicator_count > 0) %>%
+  ggplot() +
+    geom_col(
+      mapping = 
+        aes(value, name, fill = factor(indicator_count))
+      ) +
+    scale_y_discrete(
+      name = NULL, labels = as_labeller(label_vector)
+      ) +
+    scale_fill_discrete_sequential(
+      name = NULL, palette = "ag_Sunset", rev = FALSE
+      ) +
+    facet_wrap(
+      facets = ~ status, labeller = as_labeller(c(`0` = "Failure", `1` = "Safety"))
+      ) +
+    labs(
+      title = "Activation Counts in Cases of Failure and Safety",
+      subtitle = "colored by number of active parameters in a given reading",
+      x = NULL
+      ) +
+    theme(
+      panel.background = element_blank(),
+      strip.background = element_rect(fill = "antiquewhite3")
+      )
+```
+
+## 3. Factor Analysis of Operational Parameters
+
+Now we move on to the final section of our study, where we endeavor to understand what an incident of machine failure looks like. It is possible that a faulty value of cutting is more likely to occur alongside a faulty value of spindle speed, or torque with coolant pressure etc. To this end, we will leverage correspondence analysis, a dimensionality reduction technique. Such techniques are frequently used to transform data that have many variables into one that is explained by fewer components, which are themselves derived from the original variables. This makes the data more easy to interpret and work with, and avoids possible issues with multicollinearity where this may be relevant. In our case, we will use the outputs to try and understand the underlying relations of the activation of parameters.
+
+*I am using packages FactoMineR and factoextra for this analysis, although the same functionality is available in MASS. For the former, there is quite a bit of associated [material](http://factominer.free.fr/course/MOOC.html) that has helped me better understand these techniques.*
+
+```{r ca run,message=FALSE,warning=FALSE}
+ca_general <-
+  # CA of all readings
+  dataset_threshold %>%
+    select(
+      c_pres, c_temp, cutting, h_pres, speed, torque, status
+      ) %>%
+    mutate(
+      across(
+        .cols = -status, 
+        .fns = \(col) ifelse(col == "inconclusive", 0, 1)
+        )
+      ) |>
+    split(
+      #' Separate by reading status, there is no point in analyzing the
+      #' cases of safety or failure together as their indicators are 
+      #' mutually exclusive
+      ~ factor(status, labels = c("failure", "safety"))
+      ) %>%
+    mapply(
+      ., names(.),
+      SIMPLIFY = FALSE,
+      #' Removing coolant temperature from safety CA calculation-
+      #' as there are too few of them, they will dominate the resulting plot
+      FUN = 
+        \(data, name) 
+          if (name == "safety") 
+            CA(data[, -c(2, 7)], ncp = 2, graph = FALSE) 
+            else CA(data[, -7], ncp = 2, graph = FALSE)
+      )
+
+ca_split <-
+  # CA of readings by line
+  dataset_threshold %>%
+    select(
+      line, c_pres, c_temp, cutting, h_pres, speed, torque, status
+      ) %>%
+    mutate(
+      across(
+        .cols = -c(status,line), 
+        .fns = \(col) ifelse(col == "inconclusive", 0, 1)
+        )
+      ) |>
+    split(
+      ~ factor(status, labels = c("failure", "safety"))
+      ) |>
+    lapply(
+      FUN = \(data) split(data, ~ line)
+      ) %>%
+    mapply(
+      ., names(.),
+      SIMPLIFY = FALSE,
+      FUN = 
+        function (list, name) { 
+          lapply(
+            X = 
+              list,
+            FUN = 
+              \(data) 
+                if (name == "safety") 
+                CA(data[, -c(1, 3, 8)], ncp = 2, graph = FALSE) 
+                else CA(data[, -c(1, 8)], ncp = 2, graph = FALSE)
+            )
+          }
+      )
+```
+
+### 3a. Correspondence Analysis
+
+The key question of factor analysis methods is: What are the main factors the observations disagree on? It then prioritizes these factors, or variables, in building new artificial dimensions that best explain the variability in data. Our end product in this case is what is called a "biplot", where the readings are mapped according to their scores on the two most important dimensions, and the arrows corresponding to variables help with interpretation. We examine the cases of failure and safety separately.
+
+*factoextra usually serves well for plotting factor analysis results, but in this case it is vulnerable to overplotting. Many readings are the same as each other as far as this technique is concerned, since they are essentially a combination of five or six binary values. This means there are 63 or 31 possible states for the readings to be in in case of failure or safety (2\^n - 1 where the -1 is the case of all zeroes, which is not included in the analysis). So I had to do a bit of legwork here to get the count layer in. The code below is a roundabout way to do what fviz_ca does and I am not really sure if what I did here is good practice.*
+
+```{r ca plot,message=FALSE,warning=FALSE}
+mapply(
+  ca_general,
+  names(ca_general),
+  SIMPLIFY = FALSE,
+  FUN = 
+    function (data, status) {
+      ggplot() +
+        geom_count(
+          mapping = aes(x = `Dim 1`, y = `Dim 2`),
+          data = data[["row"]][["coord"]],
+          colour = "indianred"
+          ) +
+        geom_segment(
+          mapping = aes(x = 0, y = 0, xend = `Dim 1`, yend = `Dim 2`),
+          data = data[["col"]][["coord"]],
+          colour = "royalblue", 
+          arrow = arrow(angle = 20, length = unit(.06, units = "inches"))
+          ) +
+        geom_text_repel(
+          mapping = aes(x = `Dim 1`, y = `Dim 2`, label = rowname),
+          data = data[["col"]][["coord"]] |> 
+                  as.data.frame() |> rownames_to_column(),
+          colour = "royalblue", size = 3
+          ) +
+        geom_hline(
+          mapping = aes(yintercept = 0), 
+          linetype = "dashed"
+          ) +
+        geom_vline(
+          mapping = aes(xintercept = 0), 
+          linetype = "dashed"
+          ) +
+        labs(
+          title = paste(str_to_title(status), "CA Plot"),
+          x = paste0("Dim 1 (", round(data[["eig"]][1, 2], 2), "%)"),
+          y = paste0("Dim 2 (", round(data[["eig"]][2, 2], 2), "%)"),
+          size = NULL
+          ) +
+        theme(
+          panel.background = element_blank(),
+          panel.grid = element_line(colour = "grey90", linewidth = .1)
+          )
+      }
+  )
+```
+
+In the above plot for failure correspondence analysis, the first things that jump out are the vectors for hydraulic pressure and coolant temperature. This is to be expected, as these two are the least active parameters in case of failure, so those readings that do have them are more distinct. As CA is concerned with differences between readings, it scores such distinctions highly and emphasizes their status as exceptions. In contrast, vectors of the four common parameters are dwarved out, and can be seen pointing towards the largest clustering of readings on the plot. This cluster stretches along Dim 1, and the main factor here is cutting- the further to the left, the more likely are faulty cutting values. This is indicated by the relatively long cutting force vector that rests on Dim 1, pointing left. It is however practically indifferent to whether a reading is positioned up or down. Accompanying it is the less pronounced coolant pressure vector with a downward slant. This marks another possible deviation in the cluster. Finally we have spindle speed and torque as the other most common failures, which accordingly have the shortest vectors. It is notable that coolant pressure vector is longer than that of spindle speed even though it is present in more failures, possibly on account of its presence in failures having fewer parameters active.
+
+To sum up, there are four main tendencies in the data:
+
+-   The core cluster on the third quadrant. These are defined by a combination of the four most common factors torque, coolant pressure, spindle speed and cutting force, in that order. Cutting force and coolant pressure show some association.
+-   The run along hydraulic pressure on the second quadrant. Some of the readings seem to be "shared" with cutting force, but the readings further up are explained mostly by hydraulic pressure.
+-   The run going through the middle of hydraulic pressure and coolant temperature. Said parameters will be active possibly alongside a couple others.
+-   The run along coolant temperature on the fourth quadrant. This has a similar interpretation to that of hydraulic pressure. The long stretch along Dim 1 suggests negative association with cutting failure.
+
+The correspondence analysis for safety is rather easy to interpret. We have not included coolant temperature as its presence is minuscule and would throw off the analysis. Good coolant pressure values seem to be a common feature (952 cases) and therefore do not really factor in to the dimensions. On the other hand, it seems to be challenging to maintain strictly safe cutting force and spindle speed values at the same time, or torque and hydraulic pressure. There isn't anything that suggests positive association between parameters.
+
+Percentage values in the axis labels give the percentage of variability explained by the dimension. Altogether, these plots show 54% and 57.8% of the variability in their respective data, which gives us some confidence in interpreting the results. A general rule of thumb is for a dimension to not explain less than how much a variable is supposed to, given by 1/k where k is the number of input variables. In this case, this would be around 17%.
+
+We also repeat the process for each machine to see if there is any specific behavior. They turn out to be the rotations of the original plot for the most part, and do not indicate a drastic change in interpretation. Since we are operating with around one third of the values in each case, we do not believe the subtle differences are worth commenting on at this point.
+
+```{r ca split plots,message=FALSE,warning=FALSE,echo=FALSE}
+mapply(
+  # By machine
+  ca_split,
+  names(ca_split),
+  SIMPLIFY = FALSE,
+  FUN = 
+    function (list, status) {
+      mapply(
+        list,
+        names(list),
+        SIMPLIFY = FALSE,
+        FUN = 
+          function (data, line) {
+            ggplot() +
+              geom_count(
+                mapping = aes(x = `Dim 1`, y = `Dim 2`),
+                data = data[["row"]][["coord"]],
+                colour = "indianred"
+                ) +
+              geom_segment(
+                mapping = aes(x = 0, y = 0, xend = `Dim 1`, yend = `Dim 2`),
+                data = data[["col"]][["coord"]],
+                colour = "royalblue", 
+                arrow = arrow(angle = 20, length = unit(.06, units = "inches"))
+                ) +
+              geom_text_repel(
+                mapping = aes(x = `Dim 1`, y = `Dim 2`, label = rowname),
+                data = data[["col"]][["coord"]] |> 
+                        as.data.frame() |> rownames_to_column(),
+                colour = "royalblue", size = 3
+                ) +
+              geom_hline(
+                mapping = aes(yintercept = 0), 
+                linetype = "dashed"
+                ) +
+              geom_vline(
+                mapping = aes(xintercept = 0), 
+                linetype = "dashed"
+                ) +
+              labs(
+                title = paste(line, str_to_title(status), "MCA Plot"),
+                x = paste0("Dim 1 (", round(data[["eig"]][1, 2], 2), "%)"),
+                y = paste0("Dim 2 (", round(data[["eig"]][2, 2], 2), "%)"),
+                size = NULL
+                ) +
+              theme(
+                panel.background = element_blank(),
+                panel.grid = element_line(colour = "grey90", linewidth = .1)
+                )
+            }
+          ) 
+      }
+  )
+```
+
+### 3b. Multiple Correspondence Analysis
+
+To wrap up our study, we try to find out that if there are any patterns to the co-occurrence of specific intervals. This entails the treatment of our continuous parameters as discrete variables. We believe such an approach is supported by the heavily fragmented nature of the variables in question. These continuous values may be constrained by an underlying notion of operating state, which may be decided by factors such as varying demand, operational protocols and limitations of the machines themselves. We have already done a categorical analysis on the grounds of faulty vs. non-faulty and safe vs. non-safe. We want to know if a more granular approach is viable. To do so, we will continue with multiple correspondence analysis, which is an extension of correspondence analysis to non-binary categorical variables. In this case, each level of a category is treated as a variable of its own, by conversion into a complete disjunctive table indicating presence or non-presence. Our category levels will be the individual failure or safety ranges.
+
+```{r mca prep,message=FALSE,warning=FALSE}
+# Preparatory work for MCA
+sf_table_precise <-
+  sf_table %>%
+    mutate(
+      tag =
+        # Naming the intervals for multiple correspondence analysis
+        case_when(
+          is.na(ind) & status == 0 ~ 
+            paste(interval_start, "failure", sep = "_"),
+          is.na(ind) & status == 1 ~ 
+            paste(interval_start, "safe", sep = "_"),
+          status == 0 ~ 
+            paste(interval_start, interval_end, "failure", sep = "_"),
+          status <= .05 ~ 
+            paste(interval_start, interval_end, "partfailure", sep = "_"),
+          status == 1 ~ 
+            paste(interval_start, interval_end, "safe", sep = "_"),
+          status >= .95 ~ 
+            paste(interval_start, interval_end, "partsafe", sep = "_"),
+          .default = NA
+        ),
+      # Actual start and end points for the intervals - didn't end up using 
+      first_value =
+        pmap_dbl(
+          .l = 
+            pick(measure, interval_start),
+          .f = 
+            \(measure, interval_start) 
+              quantile(
+                select(dataset, all_of(measure)), 
+                probs = max(interval_start - 1L, 0) / 100, 
+                na.rm = TRUE
+                )
+          ),
+      last_value =
+        pmap_dbl(
+          .l = 
+            pick(measure, interval_end),
+          .f = 
+            \(measure, interval_end) 
+              quantile(
+                select(dataset, all_of(measure)),
+                probs = interval_end / 100, 
+                na.rm = TRUE
+                )
+          ),
+      range = last_value - first_value
+    )
+
+dataset_threshold_precise <-
+  dataset_percentiles %>%
+    select(
+      c(obs_id, date, line, year, c_pres, c_temp,
+        cutting, h_pres, speed, torque, status)
+      ) %>%
+    imodify(
+      .f =
+        function (col, idcol) {
+          # Replacing values with their corresponding tags
+          if (idcol == "status" | !is.numeric(col)) return(col)
+          left_join(
+            x = 
+              dataset_percentiles,
+            y = 
+              filter(sf_table_precise, measure == idcol),
+            by = 
+              join_by(
+                between({{ idcol }}, interval_start, interval_end)
+                )
+            ) %>%
+          mutate(
+            tag = 
+              case_when(
+                #' I have kept the percentile ranges with 95% rate in either
+                #' direction in the dataset. There are very few readings that have
+                #' only those active, and overall I haven't really done much 
+                #' with those.
+                #' Here I am shooting down the cases where they are 
+                #' counter-indicative, because of their disruptive impact.
+                status.x == 0 & grepl("safe", tag) ~ NA,
+                status.x == 1 & grepl("failure", tag) ~ NA,
+                #' Uniting all intervals smaller than five percentiles, out of the
+                #' same concern and also to reduce the number of category levels, 
+                #' there are too many of them.
+                size < 5 ~ gsub("[0-9]+_|[0-9]+_[0-9]+_", "other_", tag),
+                .default = tag
+                )
+            ) %>%
+          pull(tag)
+          }
+      )
+
+# The code to run MCA is largely the same as the one we used to run CA
+```
+
+```{r mca run,echo=FALSE,message=FALSE,warning=FALSE}
+# Mostly the same thing as CA
+mca_general <-
+  dataset_threshold_precise |>
+    split(
+      ~ factor(status, labels = c("failure", "safety"))
+      ) %>%
+    mapply(
+      ., names(.),
+      SIMPLIFY = FALSE,
+      FUN = 
+        \(data, name) 
+          if (name == "safety") 
+            MCA(data[, -c(1:4, 6, 11)], ncp = 2, graph = FALSE) 
+            else MCA(data[, -c(1:4, 11)], ncp = 2, graph = FALSE)
+      )
+
+mca_split <-
+  dataset_threshold_precise |>
+    split(
+      ~ factor(status, labels = c("failure", "safety"))
+      ) |>
+    lapply(
+      FUN = \(data) split(data, ~ line)
+      ) %>%
+    mapply(
+      ., names(.),
+      SIMPLIFY = FALSE,
+      FUN = 
+        function (list, name) { 
+          lapply(
+            X = list,
+            FUN = \(data) 
+            if (name == "safety") 
+              MCA(data[, -c(1:4, 6, 11)], ncp = 2, graph = FALSE) 
+              else MCA(data[, -c(1:4, 11)], ncp = 2, graph = FALSE)
+            )
+          }
+      )
+```
+
+```{r mca plot,message=FALSE,warning=FALSE}
+mapply(
+  mca_general,
+  names(mca_general),
+  SIMPLIFY = FALSE,
+  FUN = 
+    function (data, status) {
+      fviz_mca(
+        X = data, 
+        geom.ind = "point", 
+        repel = TRUE, 
+        col.ind = "indianred", 
+        col.var = "royalblue",
+        labelsize = 3,
+        alpha.ind = "cos2", 
+        #' ^ Mostly for better visibility - should emphasize points with 
+        #' higher and balanced scores
+        arrows = c(FALSE, TRUE),
+        title = paste(str_to_title(status), "MCA plot")
+        ) +
+      scale_alpha_continuous(
+        name = NULL, guide = NULL
+        )
+      }
+  )
+```
+
+However, the results leave a lot to desire. The variability explained by the dimensions in each case fall well below the 17% figure above specified, which means the algorithm is unable to come up with a better alternative for viewing the data. This calls into question the meaningfulness of the projection and loading vectors. While it may be worth investigating a few vectors that are close together (such as torque 40-55 with coolant pressure 43-51) we can not expect the plot to give us a satisfying picture of possible underlying relations. Potential flaws to our approach are:
+
+-   Failure to account for interval sizes. These are hard-coded into our features and give us an idea of how many readings will fall under them, which means the results will be based on what we already know to a great extent.
+
+-   Feature engineering. We have defined our intervals solely on the basis of continuity in terms of operational status. Some values that are lumped together may be characteristic of different circumstances, while some values in separate intervals may be otherwise linked.
+
+-   Treatment of inactive parameters. Parameters that are not active in a given reading are defined as NA, and most readings have at least a couple of them. This is a state that is fundamentally different from other category levels, and given that they are ubiquitous and spread out through readings and parameters, they may prove to be an obstacle to such analysis.
+
+## 4. Conclusion
+
+We have examined the 2500 readings collected from November 24, 2021 until July 7, 2022 relating to the three machines in the factory. We have noted the inconsistency in data collection and classification, and explored possible temporal connections. Having failed to uncover any such patterns, we moved on to treating the readings as independent cases. The peculiar distributions of the parameters have led us to discover that six of them exhibit differing behavior in case of failure or safety, namely coolant pressure, coolant temperature, cutting force, hydraulic pressure, spindle speed and torque. We were able to partition these values in such a way to explain almost all cases of failure and non-failure alike. Based on this partitioning, we have employed correspondence analysis methods to better see possible relations in this respect. Noting the ubiquity of faulty spindle speed and torque values, we found that there is some positive association between faulty cutting force and coolant pressure values, whereas the former seems to be negatively associated with coolant temperature. Whereas coolant temperature and hydraulic pressure appear to be rare causes of failure, they still account for a considerable portion. Looking at safe values, we found that the parameters take on safe values mostly independently from each other with coolant pressure being the biggest factor. We note that coolant pressure is a particularly important parameter that accounts for a very significant portion of both failure and safety readings, many of which have three or less active parameters. Based on the results, our suggestions at this stage are as follows:
+
+-   Review the methodology of data collection and classification.
+-   Monitor coolant pressure levels and endeavor to keep them at safe levels.
+-   Look into the trade-off between faulty cutting force and coolant temperature values.
+
+Thank you for reading.
+
+```{r mca split,include=FALSE,eval=FALSE}
+mapply(
+  mca_precise_split,
+  names(mca_precise_split),
+  SIMPLIFY = FALSE,
+  FUN = 
+    function (list, line) {
+      mapply(
+        list,
+        names(list),
+        SIMPLIFY = FALSE,
+        FUN = 
+          function (data, status) {
+            fviz_mca(
+              X = data, 
+              geom.ind = "point", 
+              repel = TRUE, 
+              col.ind = "indianred", 
+              col.var = "royalblue",
+              labelsize = 3,
+              alpha.ind = "cos2",
+              arrows = c(FALSE, TRUE),
+              title = paste(line, str_to_title(status), "MCA plot")
+              ) +
+            scale_alpha_continuous(name = NULL, guide = NULL)
+            }
+        ) 
+      }
+  )
+```
+
+```{r fig.width=20,include=FALSE,eval=FALSE}
+dataset_threshold %>%
+  select(
+    date, line, c_pres, c_temp, cutting, h_pres, speed, torque, status
+    ) %>%
+  mutate(
+    across(
+      .cols = -c(date, status,line), 
+      .fns = \(col) ifelse(col == "inconclusive", 0, 1)
+      )
+    ) %>%
+  summarise(
+    across(
+      .cols = all_of(crit_vector),
+      .fns = sum
+    ),
+    .by = c(date, line, status)
+    ) %>%
+  pivot_longer(
+    cols = -c(date, line, status),
+    names_to = "measure", values_to = "value"
+    ) %>%
+    ggplot() +
+      geom_area(
+        mapping =
+          aes(x = date, y = value, fill = as.factor(status)),
+        position = "identity", alpha = .6
+        ) +
+      scale_y_continuous(
+        name = NULL
+        ) +
+      scale_fill_discrete_diverging(
+        name = NULL, labels = c("Down", "Up"), palette = "Blue-Red 2", rev = TRUE
+        ) +
+      facet_wrap(
+        facets = vars(measure, line), nrow = 6, strip.position = "top", labeller = as_labeller(append(label_vector, c(L1 = "L1", L2 = "L2", L3 = "L3")))
+        ) +
+      labs(
+        title = "Activation Counts by Parameter",
+        subtitle = "for the entire duration",
+        x = NULL
+        ) +
+      theme(
+        panel.background = element_blank(),
+        strip.background = element_blank(),
+        strip.text.x.top = element_text(hjust = 0),
+        legend.position = "bottom"
+        )
+```
+
+```{r acf,fig.height=20,fig.width=20,include=FALSE,eval=FALSE}
+lapply(X = line_vector, FUN = \(line) acf(means_series_main[which(means_series_main[["line"]] == line), crit_vector], lag.max = 7))
+```

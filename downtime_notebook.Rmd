@@ -298,7 +298,7 @@ stdmeans_series_main <-
   group_by(line)
 ```
 
-```{r difference transformations,message=FALSE,warning=FALSE}
+```{r difference transformations,message=FALSE,warning=FALSE,echo=FALSE}
 #' Also taking first differences in case some variables are non-stationary
 diffs_series <-
   means_series_main %>%
@@ -327,7 +327,7 @@ stddiffs_series <-
   )
 ```
 
-```{r plot_corr}
+```{r plot_corr,echo=FALSE}
  #' cor() wrapper for viewing the results in ggplot2
  #' 
  #' @param data A dataframe or matrix containing two or more numeric columns.
@@ -643,11 +643,13 @@ dataset_standardised %>%
 
 *The reason I made the switch to density graphs from histograms is that I feel it conveys the idea of conditional distribution better, in contrast to the sharp blocky view that would result from plotting a histogram.*
 
-*This is where the percentile data comes in. I want to split the parameter ranges into zones of high or low failure probability. Percentiles are suitable for aggregation and are separated by a fixed distance, which renders this task a lot easier.*
+*This is where the percentile data comes in. I want to split the parameter ranges into zones of high or low failure probability. Percentiles are suitable for aggregation and are separated by a fixed distance, which renders this task a lot easier (code can be found in the Rmd file).*
 
-*The below code is a mess and I have done my best to explain it. I wouldn't be surprised at all if there is a much less complicated way to do the same thing, but I am a little wary of tinkering at this point.*
+```{r sf_table,message=FALSE,warning=FALSE,echo=FALSE}
+#' The below code is a mess and I have done my best to explain it. I wouldn't be
+#' surprised at all if there is a much less complicated way to do the same thing,
+#' but I am a little wary of tinkering at this point.
 
-```{r sf_table,message=FALSE,warning=FALSE}
 #' Since there seems to be heavy discrepancy between the values for some variables
 #' depending on failure status, I am interested in finding out which values and
 #' ranges are associated with a high probability of safety or failure. 
@@ -789,7 +791,7 @@ sf_table <-
   list_rbind()
 ```
 
-*The resulting table has 128 entries, 106 of which belong to our six variables in question. For the most part they have a failure rate of 0 or 1 (or close). Altogether, they cover a significant part of the possible range of values for their respective variables.*
+*The resulting list of ranges has 128 entries, 106 of which belong to our six variables in question. For the most part they have a failure rate of 0 or 1 (or close). Altogether, they cover a significant part of the possible range of values for their respective variables.*
 
 *Let's take a quick look at how much ground is covered. The results are much better than I expected: 1206 non-failures and 1255 failures have at least one value designated as safe or faulty, depending on their status. Since these predictors are each associated with a 100% rate of failure or safety, we don't have to worry about any overlaps. I also repeat the same counts by excluding length one intervals and find that only 13 cases of safety and one case of failure are solely explained by these. This is good to know in case we need to focus on larger intervals.*
 
@@ -1371,6 +1373,7 @@ We have examined the 2500 readings collected from November 24, 2021 until July 7
 Thank you for reading.
 
 ```{r mca split,include=FALSE,eval=FALSE}
+# Miscellaneous code
 mapply(
   mca_precise_split,
   names(mca_precise_split),

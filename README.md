@@ -8,3 +8,5 @@ viewed in the browser. The .Rmd file is the source material for the notebook and
 
 When viewing the report on the browser, I would advise initially collapsing all chunks from the dropdown menu at the top. Some of the chunks are quite long and
 may get in the way of comfortable reading.
+
+28.02.2025 - Notebook is available for viewing on https://mert-guvey.github.io/case-study-downtime/downtime_notebook.nb.html
